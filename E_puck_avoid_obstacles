@@ -1,0 +1,233 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <webots/robot.h>
+#include <webots/motor.h>
+#include <webots/distance_sensor.h>
+#include <webots/gps.h>
+#include <webots/light_sensor.h>
+#include <webots/led.h>
+
+// Robot Configuration
+#define NUM_DIST_SENSORS 8
+#define NUM_LIGHT_SENSORS 8
+#define NUM_LEDS 10  // Assuming the robot has 10 LEDs
+#define MAX_SPEED 6.28
+#define BASE_SPEED 3.0
+#define WALL_FOLLOW_THRESHOLD 150
+#define FRONT_WALL_THRESHOLD 150
+#define TURN_SPEED 2.0
+#define GPS_THRESHOLD 0.5
+#define LIGHT_THRESHOLD 0.15
+#define MIN_EXPLORATION_TIME 5000  // Minimum exploration time in simulation steps
+
+// Robot state definitions
+typedef enum {
+    STATE_INIT_GPS,
+    STATE_WALL_FOLLOW,
+    STATE_TURN,
+    STATE_FIND_LIGHT,
+    STATE_STOP
+} RobotState;
+
+// Global variables
+WbDeviceTag distance_sensors[NUM_DIST_SENSORS];
+WbDeviceTag light_sensors[NUM_LIGHT_SENSORS];
+WbDeviceTag left_motor, right_motor;
+WbDeviceTag gps;
+WbDeviceTag leds[NUM_LEDS];  // Array to hold all LEDs
+
+RobotState current_state = STATE_INIT_GPS;
+double light_max_value = -INFINITY;
+double start_position[3] = {0};
+double light_max_position[3] = {0};
+int gps_init_attempts = 0;
+int exploration_time = 0;  // Variable to track exploration time
+
+// Initialize robot devices
+void init_robot() {
+    wb_robot_init();
+    int time_step = wb_robot_get_basic_time_step();
+
+    // Distance sensors Initialization
+    for (int i = 0; i < NUM_DIST_SENSORS; i++) {
+        char sensor_name[4];
+        sprintf(sensor_name, "ps%d", i);
+        distance_sensors[i] = wb_robot_get_device(sensor_name);
+        wb_distance_sensor_enable(distance_sensors[i], time_step);
+    }
+
+    // Light sensors Initialization
+    for (int i = 0; i < NUM_LIGHT_SENSORS; i++) {
+        char sensor_name[4];
+        sprintf(sensor_name, "ls%d", i);
+        light_sensors[i] = wb_robot_get_device(sensor_name);
+        wb_light_sensor_enable(light_sensors[i], time_step);
+    }
+
+    // Motors Initialization
+    left_motor = wb_robot_get_device("left wheel motor");
+    right_motor = wb_robot_get_device("right wheel motor");
+    wb_motor_set_position(left_motor, INFINITY);
+    wb_motor_set_position(right_motor, INFINITY);
+
+    // GPS Initialization
+    gps = wb_robot_get_device("gps");
+    wb_gps_enable(gps, time_step);
+
+    // LEDs Initialization
+    for (int i = 0; i < NUM_LEDS; i++) {
+        char led_name[5];
+        sprintf(led_name, "led%d", i);
+        leds[i] = wb_robot_get_device(led_name);
+    }
+}
+
+// Turn off all LEDs
+void turn_off_leds() {
+    for (int i = 0; i < NUM_LEDS; i++) {
+        wb_led_set(leds[i], 0);
+    }
+}
+
+// Turn on all LEDs
+void turn_on_leds() {
+    for (int i = 0; i < NUM_LEDS; i++) {
+        wb_led_set(leds[i], 1);
+    }
+}
+
+int is_valid_gps_reading() {
+    const double *gps_values = wb_gps_get_values(gps);
+    return (gps_values[0] == gps_values[0]) && // Check for NaN
+           (gps_values[1] == gps_values[1]) && 
+           (gps_values[0] != 0.0) && 
+           (gps_values[1] != 0.0);
+}
+
+// Read/update light sensor values
+void light_reading_update() {
+    double current_light = 0;
+    for (int i = 0; i < NUM_LIGHT_SENSORS; i++) {
+        current_light += wb_light_sensor_get_value(light_sensors[i]);
+    }
+    current_light /= NUM_LIGHT_SENSORS;
+
+    const double *gps_values = wb_gps_get_values(gps);
+
+    if (current_light > light_max_value) {
+        light_max_value = current_light;
+        memcpy(light_max_position, gps_values, 3 * sizeof(double));
+        printf("New brightest spot: %.2f at (%.2f, %.2f)\n", 
+               light_max_value, light_max_position[0], light_max_position[1]);
+    }
+}
+
+int is_near_start() {
+    const double *current_pos = wb_gps_get_values(gps);
+    double dx = current_pos[0] - start_position[0];
+    double dy = current_pos[1] - start_position[1];
+    return sqrt(dx*dx + dy*dy) < GPS_THRESHOLD;
+}
+
+// Wall following behavior
+void wall_follow_behavior(double *sensors, double *left_speed, double *right_speed) {
+    double front_left = sensors[7];
+    double front = sensors[0];
+    double front_right = sensors[1];
+    double right = sensors[2];
+
+    // Obstacle detection
+    if (front > FRONT_WALL_THRESHOLD || front_left > FRONT_WALL_THRESHOLD || front_right > FRONT_WALL_THRESHOLD) {
+        *left_speed = -TURN_SPEED;
+        *right_speed = TURN_SPEED;
+        return;
+    }
+
+    // Wall following logic
+    double error = WALL_FOLLOW_THRESHOLD - right;
+    
+    if (error > 50) {
+        *left_speed = BASE_SPEED;
+        *right_speed = BASE_SPEED * 0.5;
+    } else if (error < -50) {
+        *left_speed = BASE_SPEED * 0.5;
+        *right_speed = BASE_SPEED;
+    } else {
+        *left_speed = BASE_SPEED;
+        *right_speed = BASE_SPEED;
+    }
+}
+
+int main() {
+    init_robot();
+    int time_step = wb_robot_get_basic_time_step();
+
+    // Turn off all LEDs initially
+    turn_off_leds();
+
+    // Robot main control loop
+    while (wb_robot_step(time_step) != -1) {
+        double left_speed = 0, right_speed = 0;
+        double sensors[NUM_DIST_SENSORS];
+        
+        // Read sensors
+        for (int i = 0; i < NUM_DIST_SENSORS; i++) {
+            sensors[i] = wb_distance_sensor_get_value(distance_sensors[i]);
+        }
+
+        // State machine
+        switch (current_state) {
+            case STATE_INIT_GPS:
+                if (is_valid_gps_reading()) {
+                    const double *initial_pos = wb_gps_get_values(gps);
+                    memcpy(start_position, initial_pos, 3 * sizeof(double));
+                    printf("Start position: (%.2f, %.2f)\n", start_position[0], start_position[1]);
+                    current_state = STATE_WALL_FOLLOW;
+                } else {
+                    gps_init_attempts++;
+                    printf("Waiting for valid GPS reading... (attempt %d)\n", gps_init_attempts);
+                    left_speed = BASE_SPEED;
+                    right_speed = BASE_SPEED;
+                }
+                break;
+
+            case STATE_WALL_FOLLOW:
+                light_reading_update();
+                wall_follow_behavior(sensors, &left_speed, &right_speed);
+                exploration_time++;
+                if (is_near_start() && exploration_time >= MIN_EXPLORATION_TIME) {
+                    printf("Exploration complete. Seeking brightest spot...\n");
+                    current_state = STATE_FIND_LIGHT;
+                    exploration_time = 0;
+                }
+                break;
+
+            case STATE_FIND_LIGHT:
+                light_reading_update();
+                wall_follow_behavior(sensors, &left_speed, &right_speed);
+                const double *current_pos = wb_gps_get_values(gps);
+                double dx = current_pos[0] - light_max_position[0];
+                double dy = current_pos[1] - light_max_position[1];
+                if (sqrt(dx*dx + dy*dy) < LIGHT_THRESHOLD) {
+                    printf("Reached brightest spot at (%.2f, %.2f)!\n", 
+                           light_max_position[0], light_max_position[1]);
+                    turn_on_leds();  // Turn on all LEDs
+                    current_state = STATE_STOP;
+                }
+                break;
+
+            case STATE_STOP:
+                left_speed = 0;
+                right_speed = 0;
+                break;
+        }
+
+        wb_motor_set_velocity(left_motor, left_speed);
+        wb_motor_set_velocity(right_motor, right_speed);
+    }
+
+    wb_robot_cleanup();
+    return 0;
+}
